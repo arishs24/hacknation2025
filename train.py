@@ -1,11 +1,11 @@
 # ============================================
 # Mini AlphaFold – Binding (Core: 2 models + 1 calibrator)
-# Baseline: ECFP4 -> Logistic Regression
+# Baseline: ECFP4 -> Logistic Regression (or best model from comparison)
 # Fusion: [ECFP4 || ESM2-sequence embedding] -> tiny MLP
 # Calibrator: Temperature scaling on validation logits
 # ============================================
 
-# ---- Imports
+# ---- Core Imports
 import os
 import math
 import pickle
@@ -14,23 +14,47 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from pathlib import Path
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score, average_precision_score, accuracy_score, f1_score, brier_score_loss
-from sklearn.preprocessing import StandardScaler
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoModel, AutoTokenizer
 
-# ECFP4``
+# ECFP4 molecular fingerprints
 from rdkit import Chem
 from rdkit.Chem import DataStructs, rdFingerprintGenerator
 
-# ---- Config
-TRAIN_CSV = "bindingdb_kinase_top10_train.csv"  # your prepared training set (no split needed)
-VAL_CSV   = "bindingdb_kinase_top10_val.csv"     # your prepared validation set
-SEED = 42
-ECFP_BITS = 2048
-ECFP_RADIUS = 2           # ECFP4 => radius=2
+# Import baseline model comparison functionality and shared utilities
+try:
+    from step1compare import (
+        run_step1_comparison_external, 
+        smiles_to_ecfp, 
+        SEED, 
+        ECFP_BITS, 
+        ECFP_RADIUS,
+        TRAIN_CSV,
+        VAL_CSV
+    )
+except ImportError:
+    print("Warning: step1compare module not found. Using default LogisticRegression only.")
+    run_step1_comparison_external = None
+    # Define fallback constants and function
+    SEED = 42
+    ECFP_BITS = 2048
+    ECFP_RADIUS = 2
+    TRAIN_CSV = "bindingdb_kinase_top10_train.csv"
+    VAL_CSV = "bindingdb_kinase_top10_val.csv"
+    
+    def smiles_to_ecfp(smiles: str, n_bits=ECFP_BITS, radius=ECFP_RADIUS):
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            return np.zeros(n_bits, dtype=np.float32)
+        generator = rdFingerprintGenerator.GetMorganGenerator(radius=radius, fpSize=n_bits)
+        fp = generator.GetFingerprint(mol)
+        arr = np.zeros((n_bits,), dtype=np.int8)
+        DataStructs.ConvertToNumpyArray(fp, arr)
+        return arr.astype(np.float32)
+
+# ---- Config  
 BATCH_SIZE = 32
 LR = 2e-3
 EPOCHS = 32
@@ -38,15 +62,17 @@ PROT_MODEL_NAME = "facebook/esm2_t6_8M_UR50D"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Pre-trained model loading options
-LOAD_PRETRAINED = True  # Set to True to load pre-trained models
+LOAD_PRETRAINED = False  # Set to True to load pre-trained models
 PRETRAINED_DIR = "saved_models"  # Directory containing pre-trained models
 LOAD_BASELINE = True     # Load pre-trained baseline model
 LOAD_FUSION = True       # Load pre-trained fusion model  
 LOAD_SCALER = True       # Load pre-trained temperature scaler
 LOAD_PROTEIN_CACHE = True  # Load pre-computed protein embeddings
 FINE_TUNE_MODE = False   # If True, use lower learning rate for fine-tuning
-torch.manual_seed(SEED)
-np.random.seed(SEED)
+
+# Baseline model comparison options
+USE_STEP1_COMPARE = True  # Set to True to test multiple baseline models and select best
+BASELINE_METRIC = 'auroc'  # Metric to optimize: 'auroc', 'accuracy', 'f1', 'auprc'
 
 # --------------------------------------------
 # Utils
@@ -55,26 +81,13 @@ def set_seed(seed=SEED):
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-def smiles_to_ecfp(smiles: str, n_bits=ECFP_BITS, radius=ECFP_RADIUS):
-    mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
-        # empty vector for invalid SMILES
-        return np.zeros(n_bits, dtype=np.float32)
-    
-    # Use the modern MorganGenerator approach instead of deprecated GetMorganFingerprintAsBitVect
-    generator = rdFingerprintGenerator.GetMorganGenerator(radius=radius, fpSize=n_bits)
-    fp = generator.GetFingerprint(mol)
-    
-    arr = np.zeros((n_bits,), dtype=np.int8)
-    DataStructs.ConvertToNumpyArray(fp, arr)
-    return arr.astype(np.float32)
+# Set random seeds for reproducibility
+set_seed(SEED)
 
-# --------------------------------------------
 # Pre-trained model loading functions
-# --------------------------------------------
-def load_pretrained_baseline(pretrained_dir=PRETRAINED_DIR):
+def load_pretrained_baseline(pretrained_dir=PRETRAINED_DIR, best_baseline=None):
     """Load pre-trained baseline logistic regression model"""
-    baseline_path = os.path.join(pretrained_dir, "baseline_logreg.pkl")
+    baseline_path = os.path.join(pretrained_dir, f"{best_baseline}.pkl")
     if os.path.exists(baseline_path):
         with open(baseline_path, "rb") as f:
             model = pickle.load(f)
@@ -122,10 +135,7 @@ def load_protein_cache(pretrained_dir=PRETRAINED_DIR):
         print(f"✗ Protein cache not found at {cache_path}")
         return {}
 
-# --------------------------------------------
-# Load data
-# Expecting columns: sequence, smiles, label (0/1). Optional: px (float)
-# --------------------------------------------
+# Load and preprocess data
 train_df = pd.read_csv(TRAIN_CSV)
 val_df   = pd.read_csv(VAL_CSV)
 
@@ -133,10 +143,13 @@ for df in (train_df, val_df):
     df["sequence"] = df["sequence"].astype(str).str.replace(r"\s+", "", regex=True)
     df["smiles"]   = df["smiles"].astype(str).str.strip()
 
-# =====================================================================================
-# 1) BASELINE MODEL (Logistic Regression on ECFP4)  — "fast & trusty"
-# =====================================================================================
-print("\n[1/3] Training Baseline (LogReg on ECFP4) ...")
+# ============================================
+# STEP 1: BASELINE MODEL COMPARISON
+# ============================================
+if USE_STEP1_COMPARE:
+    print("\n[1/3] Step 1: Baseline Model Comparison...")
+else:
+    print("\n[1/3] Training Baseline (LogReg on ECFP4)...")
 
 X_train_ecfp = np.stack([smiles_to_ecfp(s) for s in train_df["smiles"].tolist()], axis=0)
 y_train = train_df["label"].astype(int).to_numpy()
@@ -144,35 +157,53 @@ y_train = train_df["label"].astype(int).to_numpy()
 X_val_ecfp = np.stack([smiles_to_ecfp(s) for s in val_df["smiles"].tolist()], axis=0)
 y_val = val_df["label"].astype(int).to_numpy()
 
-# Optional: scale features (binary bits can be left unscaled; here we skip scaling)
 # Load pre-trained baseline model or train new one
 if LOAD_PRETRAINED and LOAD_BASELINE:
     logreg = load_pretrained_baseline()
     if logreg is None:
         print("Pre-trained baseline not found, training new model...")
-        logreg = LogisticRegression(max_iter=500, solver="lbfgs", random_state=SEED)
-        logreg.fit(X_train_ecfp, y_train)
+        if USE_STEP1_COMPARE and run_step1_comparison_external is not None:
+            logreg, model_name, val_proba_baseline = run_step1_comparison_external(
+                X_train_ecfp, y_train, X_val_ecfp, y_val, 
+                metric=BASELINE_METRIC
+            )
+            print(f"Selected {model_name} as best baseline model")
+        else:
+            print("Using default LogisticRegression...")
+            logreg = LogisticRegression(max_iter=500, solver="lbfgs", random_state=SEED)
+            logreg.fit(X_train_ecfp, y_train)
+            val_proba_baseline = logreg.predict_proba(X_val_ecfp)[:, 1]
+    
     else:
         print("Using pre-trained baseline model (skipping training)")
+        val_proba_baseline = logreg.predict_proba(X_val_ecfp)[:, 1]
 else:
     # Train new baseline model
-    logreg = LogisticRegression(max_iter=500, solver="lbfgs", random_state=SEED)
-    logreg.fit(X_train_ecfp, y_train)
+    if USE_STEP1_COMPARE and run_step1_comparison_external is not None:
+        # Use external step1compare to find best model
+        logreg, model_name, val_proba_baseline = run_step1_comparison_external(
+            X_train_ecfp, y_train, X_val_ecfp, y_val, 
+            metric=BASELINE_METRIC
+        )
+        print(f"\nSelected {model_name} as best baseline model")
+    else:
+        # Use default logistic regression
+        logreg = LogisticRegression(max_iter=500, solver="lbfgs", random_state=SEED)
+        logreg.fit(X_train_ecfp, y_train)
+        val_proba_baseline = logreg.predict_proba(X_val_ecfp)[:, 1]
 
-val_proba_baseline = logreg.predict_proba(X_val_ecfp)[:, 1]
-val_pred_baseline  = (val_proba_baseline >= 0.5).astype(int)
+val_pred_baseline = (val_proba_baseline >= 0.5).astype(int)
 
-print("Baseline metrics (ECFP4->LogReg):")
+print("\nBaseline Model Final Results:")
 print("  AUROC :", roc_auc_score(y_val, val_proba_baseline))
 print("  AUPRC :", average_precision_score(y_val, val_proba_baseline))
 print("  Acc   :", accuracy_score(y_val, val_pred_baseline))
 print("  F1    :", f1_score(y_val, val_pred_baseline))
 print("  Brier :", brier_score_loss(y_val, val_proba_baseline))
 
-# =====================================================================================
-# 2) MINI FUSION MODEL (ECFP4 || ESM2 embedding) -> tiny MLP (binary classification)
-# Optional second head for pKd regression if 'px' provided
-# =====================================================================================
+# ============================================
+# STEP 2: FUSION MODEL TRAINING
+# ============================================
 
 print("\n[2/3] Preparing protein embeddings with ESM2 (frozen)...")
 
@@ -293,7 +324,7 @@ if LOAD_PRETRAINED and LOAD_FUSION:
             if FINE_TUNE_MODE:
                 print(f"Fine-tuning mode: Using reduced learning rate {lr}")
         else:
-            print(f"✗ Model architecture mismatch:")
+            print("✗ Model architecture mismatch:")
             print(f"  Expected: in_dim={in_dim}, reg_head={reg_on}")
             print(f"  Found: in_dim={config['in_dim']}, reg_head={config['reg_head']}")
             print("Creating new model...")
@@ -385,9 +416,9 @@ for epoch in range(1, EPOCHS+1):
 if best_state is not None:
     model.load_state_dict(best_state)
 
-# =====================================================================================
-# 3) CALIBRATOR — Temperature scaling on validation logits
-# =====================================================================================
+# ============================================
+# STEP 3: TEMPERATURE SCALING CALIBRATION
+# ============================================
 print("\n[3/3] Calibrating with Temperature Scaling (on fusion logits)...")
 
 # Gather logits/labels from val
@@ -439,8 +470,8 @@ scaler, cal_loss = fit_temperature(val_logits, val_labels)
 print(f"  Learned temperature = {float(torch.exp(scaler.log_temp).detach().cpu()):.3f} (val BCE={cal_loss:.4f})")
 
 # Metrics pre/post calibration
-def probs_from_logits(l):
-    return torch.sigmoid(l).cpu().detach().numpy()
+def probs_from_logits(logits):
+    return torch.sigmoid(logits).cpu().detach().numpy()
 
 pre_probs = probs_from_logits(val_logits)
 post_probs = probs_from_logits(scaler(val_logits))
@@ -452,11 +483,9 @@ for name, probs in [("pre", pre_probs), ("post", post_probs)]:
           f"Acc={accuracy_score(yva_cls, (probs>=0.5).astype(int)):.3f} "
           f"Brier={brier_score_loss(yva_cls, probs):.4f}")
 
-# =====================================================================================
-# Tiny demo: predict function
-#   - Baseline: ECFP -> probability
-#   - Fusion: ECFP||Prot -> uncalibrated & calibrated prob
-# =====================================================================================
+# ============================================
+# PREDICTION FUNCTIONS
+# ============================================
 @torch.no_grad()
 def predict_baseline(smiles: str):
     x = smiles_to_ecfp(smiles)[None, :]
@@ -535,22 +564,3 @@ print("  - Trained fusion MLP (saved to saved_models/fusion_mlp.pth)")
 print("  - Temperature scaler (saved to saved_models/temperature_scaler.pth)")
 print("  - Protein embeddings cache (saved to saved_models/protein_cache.pkl)")
 print("  - CSV: val_predictions_core.csv")
-
-# =====================================================================================
-# HOW TO USE PRE-TRAINED MODELS:
-# =====================================================================================
-# To load and continue training from pre-trained models, modify the config section:
-#
-# LOAD_PRETRAINED = True       # Enable pre-trained model loading
-# LOAD_BASELINE = True         # Load pre-trained baseline model
-# LOAD_FUSION = True           # Load pre-trained fusion model
-# LOAD_SCALER = True           # Load pre-trained temperature scaler
-# LOAD_PROTEIN_CACHE = True    # Load pre-computed protein embeddings
-# FINE_TUNE_MODE = True        # Use lower learning rate for fine-tuning
-#
-# This will:
-# - Skip training if pre-trained models are found and compatible
-# - Load protein embedding cache to save computation time
-# - Use reduced learning rate (LR * 0.1) if FINE_TUNE_MODE = True
-# - Fall back to training new models if pre-trained ones are not found
-# =====================================================================================
