@@ -18,6 +18,8 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score, average_precision_score, accuracy_score, f1_score, brier_score_loss
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoModel, AutoTokenizer
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 # ECFP4 molecular fingerprints
 from rdkit import Chem
@@ -74,6 +76,11 @@ FINE_TUNE_MODE = False   # If True, use lower learning rate for fine-tuning
 USE_STEP1_COMPARE = True  # Set to True to test multiple baseline models and select best
 BASELINE_METRIC = 'auroc'  # Metric to optimize: 'auroc', 'accuracy', 'f1', 'auprc'
 
+# Plotting and overfitting detection options
+PLOT_TRAINING_CURVES = True  # Create training curves plot to check overfitting
+EARLY_STOPPING_PATIENCE = 5  # Stop training if no improvement for N epochs (0 to disable)
+EARLY_STOPPING_MIN_DELTA = 0.001  # Minimum improvement considered significant
+
 # --------------------------------------------
 # Utils
 # --------------------------------------------
@@ -83,6 +90,95 @@ def set_seed(seed=SEED):
 
 # Set random seeds for reproducibility
 set_seed(SEED)
+
+def plot_training_curves(train_losses, val_metrics_history, save_path="training_curves.png"):
+    """
+    Plot training curves to check for overfitting
+    
+    Args:
+        train_losses: List of training losses per epoch
+        val_metrics_history: List of validation metrics dictionaries per epoch
+        save_path: Path to save the plot
+    """
+    epochs = range(1, len(train_losses) + 1)
+    val_aurocs = [m['auroc'] for m in val_metrics_history]
+    val_auprcs = [m['auprc'] for m in val_metrics_history]
+    val_accs = [m['acc'] for m in val_metrics_history]
+    val_briers = [m['brier'] for m in val_metrics_history]
+    
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
+    
+    # Training Loss
+    ax1.plot(epochs, train_losses, 'b-', linewidth=2, label='Training Loss')
+    ax1.set_title('Training Loss Over Time', fontsize=14)
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Loss')
+    ax1.grid(True, alpha=0.3)
+    ax1.legend()
+    
+    # AUROC
+    ax2.plot(epochs, val_aurocs, 'g-', linewidth=2, label='Validation AUROC')
+    best_epoch = np.argmax(val_aurocs) + 1
+    best_auroc = max(val_aurocs)
+    ax2.axvline(x=best_epoch, color='r', linestyle='--', alpha=0.7, label=f'Best AUROC: {best_auroc:.3f} @ Epoch {best_epoch}')
+    ax2.set_title('Validation AUROC Over Time', fontsize=14)
+    ax2.set_xlabel('Epoch')
+    ax2.set_ylabel('AUROC')
+    ax2.grid(True, alpha=0.3)
+    ax2.legend()
+    
+    # AUPRC and Accuracy
+    ax3.plot(epochs, val_auprcs, 'orange', linewidth=2, label='Validation AUPRC')
+    ax3_twin = ax3.twinx()
+    ax3_twin.plot(epochs, val_accs, 'purple', linewidth=2, label='Validation Accuracy')
+    ax3.set_title('Validation AUPRC & Accuracy', fontsize=14)
+    ax3.set_xlabel('Epoch')
+    ax3.set_ylabel('AUPRC', color='orange')
+    ax3_twin.set_ylabel('Accuracy', color='purple')
+    ax3.grid(True, alpha=0.3)
+    ax3.legend(loc='lower left')
+    ax3_twin.legend(loc='lower right')
+    
+    # Brier Score (lower is better)
+    ax4.plot(epochs, val_briers, 'red', linewidth=2, label='Validation Brier Score')
+    best_brier_epoch = np.argmin(val_briers) + 1
+    best_brier = min(val_briers)
+    ax4.axvline(x=best_brier_epoch, color='g', linestyle='--', alpha=0.7, label=f'Best Brier: {best_brier:.3f} @ Epoch {best_brier_epoch}')
+    ax4.set_title('Validation Brier Score Over Time', fontsize=14)
+    ax4.set_xlabel('Epoch')
+    ax4.set_ylabel('Brier Score (lower is better)')
+    ax4.grid(True, alpha=0.3)
+    ax4.legend()
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"📊 Training curves saved to: {save_path}")
+    
+    # Show overfitting analysis
+    print("\n🔍 OVERFITTING ANALYSIS:")
+    
+    # Check if training loss is still decreasing but validation metrics plateau/decline
+    if len(train_losses) >= 10:
+        recent_train_trend = np.mean(train_losses[-5:]) - np.mean(train_losses[-10:-5])
+        recent_auroc_trend = np.mean(val_aurocs[-5:]) - np.mean(val_aurocs[-10:-5])
+        
+        if recent_train_trend < -0.01 and recent_auroc_trend < 0.005:
+            print("  ⚠️  Possible overfitting detected:")
+            print("     - Training loss still decreasing significantly")
+            print("     - Validation AUROC plateauing or declining")
+        elif recent_auroc_trend > 0.01:
+            print("  ✅ Model still improving on validation set")
+        else:
+            print("  ➡️  Training appears stable")
+    
+    # Check gap between best and final performance
+    final_auroc = val_aurocs[-1]
+    auroc_gap = best_auroc - final_auroc
+    if auroc_gap > 0.02:
+        print(f"  ⚠️  Performance gap: Best AUROC ({best_auroc:.3f}) vs Final ({final_auroc:.3f}) = {auroc_gap:.3f}")
+        print("     Consider early stopping or regularization")
+    
+    return fig
 
 # Pre-trained model loading functions
 def load_pretrained_baseline(pretrained_dir=PRETRAINED_DIR, best_baseline=None):
@@ -379,6 +475,13 @@ def evaluate(model, loader):
 
 print("\n[2/3] Training Fusion MLP ...")
 best_auroc, best_state = -1.0, None
+best_epoch = 0
+patience_counter = 0
+
+# Track metrics for plotting
+train_losses = []
+val_metrics_history = []
+
 for epoch in range(1, EPOCHS+1):
     model.train()
     total_loss = 0.0
@@ -402,19 +505,50 @@ for epoch in range(1, EPOCHS+1):
         opt.step()
         total_loss += loss.item()
 
+    # Calculate average training loss for this epoch
+    avg_train_loss = total_loss / len(train_loader)
+    train_losses.append(avg_train_loss)
+
     val_metrics, val_logits, _ = evaluate(model, val_loader)
-    if val_metrics["auroc"] > best_auroc:
+    val_metrics_history.append(val_metrics.copy())
+    
+    # Check for improvement
+    improved = False
+    if val_metrics["auroc"] > best_auroc + EARLY_STOPPING_MIN_DELTA:
         best_auroc = val_metrics["auroc"]
         best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+        best_epoch = epoch
+        patience_counter = 0
+        improved = True
+    else:
+        patience_counter += 1
 
-    print(f"Epoch {epoch:02d} | train_loss={total_loss/len(train_loader):.4f} | "
+    # Print epoch results with improvement indicator
+    improvement_indicator = "🎯" if improved else "  "
+    print(f"Epoch {epoch:02d} {improvement_indicator} | train_loss={avg_train_loss:.4f} | "
           f"VAL auroc={val_metrics['auroc']:.3f} auprc={val_metrics['auprc']:.3f} "
           f"acc={val_metrics['acc']:.3f} f1={val_metrics['f1']:.3f} brier={val_metrics['brier']:.4f}"
-          + (f" | rmse_px={val_metrics['rmse_px']:.3f} mae_px={val_metrics['mae_px']:.3f}" if reg_on else ""))
+          + (f" | rmse_px={val_metrics['rmse_px']:.3f} mae_px={val_metrics['mae_px']:.3f}" if reg_on and 'rmse_px' in val_metrics else ""))
+    
+    # Early stopping check
+    if EARLY_STOPPING_PATIENCE > 0 and patience_counter >= EARLY_STOPPING_PATIENCE:
+        print(f"\n⏹️  Early stopping triggered! No improvement for {EARLY_STOPPING_PATIENCE} epochs.")
+        print(f"   Best AUROC: {best_auroc:.3f} at epoch {best_epoch}")
+        break
 
-# Load best
+# Load best model
 if best_state is not None:
     model.load_state_dict(best_state)
+    print(f"\n✅ Loaded best model from epoch {best_epoch} (AUROC: {best_auroc:.3f})")
+
+# Create training curves plot
+if PLOT_TRAINING_CURVES:
+    print("\n📊 Creating training curves plot...")
+    try:
+        plot_training_curves(train_losses, val_metrics_history, "saved_models/training_curves.png")
+    except Exception as e:
+        print(f"Warning: Could not create plot - {e}")
+        print("You may need to install matplotlib: pip install matplotlib seaborn")
 
 # ============================================
 # STEP 3: TEMPERATURE SCALING CALIBRATION
